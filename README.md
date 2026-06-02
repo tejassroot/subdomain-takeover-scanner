@@ -26,6 +26,8 @@ cd subdomain-takeover-scanner
 
 pip install -r requirements.txt
 chmod +x takeoverpossible
+sudo cp recon /usr/local/bin/recon
+
 ```
 
 ## Usage
