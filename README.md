@@ -24,7 +24,7 @@ Python-based strict subdomain takeover detection framework focused on minimizing
 git clone https://github.com/tejassroot/subdomain-takeover-scanner.git
 cd subdomain-takeover-scanner
 
-pip install -r requirements.txt
+
 chmod +x takeoverpossible
 sudo cp takeoverpossible /usr/local/bin/takeoverpossible
 ```
