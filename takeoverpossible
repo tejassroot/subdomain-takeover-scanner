@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+
+"""
+Ultra Strict Subdomain Takeover Scanner
+Focused on minimizing false positives.
+
+Features:
+- DNS validation
+- Dead target verification
+- HTTP fingerprinting
+- SSL checks
+- False positive filtering
+- Claimability validation
+- Multi-threaded scanning
+- JSON export
+- Colored output
+"""
+
+import dns.resolver
+import requests
+import socket
+import sys
+import json
+import re
+import time
+import ssl
+import subprocess
+
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed
+)
+
+from urllib3.exceptions import (
+    InsecureRequestWarning
+)
+
+# Disable SSL warnings
+requests.packages.urllib3.disable_warnings(
+    InsecureRequestWarning
+)
+
+# =========================================================
+# COLORS
+# =========================================================
+
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+CYAN = "\033[96m"
+WHITE = "\033[97m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+HEADERS = {
+    "User-Agent":
+    "Mozilla/5.0 (Security Research)"
+}
+
+GENERIC_FALSE_POSITIVES = [
+    "cloudflare",
+    "akamai",
+    "fastly error",
+    "access denied",
+    "origin unreachable",
+    "default backend",
+    "parkingcrew",
+    "coming soon"
+]
+
+NON_CLAIMABLE = [
+    "shopify",
+    "azure-appservice",
+    "aws-elb"
+]
+
+SERVICES = {
+
+    "github-pages": {
+        "patterns": [
+            r"\.github\.io$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "There isn't a GitHub Pages site here"
+        ],
+        "takeoverable": True
+    },
+
+    "heroku": {
+        "patterns": [
+            r"\.herokuapp\.com$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "No such app"
+        ],
+        "takeoverable": True
+    },
+
+    "aws-s3": {
+        "patterns": [
+            r"\.s3\.amazonaws\.com$",
+            r"\.s3-[a-z0-9-]+\.amazonaws\.com$"
+        ],
+        "headers": [
+            "x-amz-request-id",
+            "x-amz-id-2"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "NoSuchBucket",
+            "The specified bucket does not exist"
+        ],
+        "takeoverable": True
+    },
+
+    "azure-blob": {
+        "patterns": [
+            r"\.blob\.core\.windows\.net$"
+        ],
+        "headers": [
+            "x-ms-version"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "The specified blob does not exist"
+        ],
+        "takeoverable": True
+    },
+
+    "shopify": {
+        "patterns": [
+            r"\.myshopify\.com$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "Sorry, this shop is currently unavailable"
+        ],
+        "takeoverable": False
+    },
+
+    "azure-appservice": {
+        "patterns": [
+            r"\.azurewebsites\.net$"
+        ],
+        "status_codes": [403],
+        "keywords": [
+            "Site Disabled"
+        ],
+        "takeoverable": False
+    }
+}
+
+# =========================================================
+# CLEAN DOMAIN INPUT
+# =========================================================
+
+def clean_domain(domain):
+
+    domain = domain.strip()
+
+    domain = re.sub(
+        r'^\[.*?\]\s*',
+        '',
+        domain
+    )
+
+    return domain
+
+
+# =========================================================
+# DNS FUNCTIONS
+# =========================================================
+
+def resolve_cname(domain):
+
+    try:
+
+        resolver = dns.resolver.Resolver()
+
+        resolver.timeout = 5
+        resolver.lifetime = 5
+
+        answers = resolver.resolve(
+            domain,
+            "CNAME"
+        )
+
+        return [
+            str(r.target).rstrip(".")
+            for r in answers
+        ]
+
+    except dns.resolver.NoAnswer:
+        return []
+
+    except dns.resolver.NXDOMAIN:
+        return None
+
+    except Exception:
+        return []
+
+
+def check_target_exists(target):
+
+    try:
+
+        socket.gethostbyname(target)
+
+        return True
+
+    except socket.gaierror:
+        return False
+
+    except Exception:
+        return None
+
+
+def verify_dead_target(target):
+
+    checks = []
+
+    for _ in range(3):
+
+        result = check_target_exists(
+            target
+        )
+
+        checks.append(result)
+
+        time.sleep(1)
+
+    return all(x is False for x in checks)
+
+
+# =========================================================
+# SSL CHECK
+# =========================================================
+
+def check_ssl(domain):
+
+    try:
+
+        ssl.get_server_certificate(
+            (domain, 443)
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+
+# =========================================================
+# DIG VALIDATION
+# =========================================================
+
+def run_dig(domain):
+
+    try:
+
+        result = subprocess.run(
+            ["dig", domain, "CNAME"],
+            capture_output=True,
+            text=True
+        )
+
+        return result.stdout
+
+    except Exception:
+        return None
+
+
+# =========================================================
+# HTTP FUNCTIONS
+# =========================================================
+
+def fetch_http(domain):
+
+    results = {}
+
+    for proto in ["https", "http"]:
+
+        url = f"{proto}://{domain}"
+
+        try:
+
+            response = requests.get(
+                url,
+                timeout=10,
+                verify=False,
+                allow_redirects=False,
+                headers=HEADERS
+            )
+
+            results[proto] = {
+                "status_code":
+                response.status_code,
+
+                "headers":
+                dict(response.headers),
+
+                "body":
+                response.text[:3000]
+            }
+
+        except Exception as e:
+
+            results[proto] = {
+                "error": str(e)
+            }
+
+    return results
+
+
+# =========================================================
+# SERVICE DETECTION
+# =========================================================
+
+def detect_service(cname_target):
+
+    for service, config in SERVICES.items():
+
+        for pattern in config["patterns"]:
+
+            if re.search(
+                pattern,
+                cname_target.lower()
+            ):
+
+                return service
+
+    return None
+
+
+# =========================================================
+# FALSE POSITIVE FILTER
+# =========================================================
+
+def contains_false_positive(body):
+
+    body = body.lower()
+
+    return any(
+        fp in body
+        for fp in GENERIC_FALSE_POSITIVES
+    )
+
+
+# =========================================================
+# HTTP VALIDATION
+# =========================================================
+
+def validate_http(service, responses):
+
+    config = SERVICES[service]
+
+    for proto, resp in responses.items():
+
+        if "status_code" not in resp:
+            continue
+
+        body = resp.get(
+            "body",
+            ""
+        ).lower()
+
+        headers = {
+            k.lower(): v
+            for k, v in resp.get(
+                "headers", {}
+            ).items()
+        }
+
+        if contains_false_positive(body):
+            return False
+
+        status_match = (
+            resp["status_code"]
+            in config["status_codes"]
+        )
+
+        keyword_match = any(
+            kw.lower() in body
+            for kw in config["keywords"]
+        )
+
+        header_match = True
+
+        if config.get("headers"):
+
+            header_match = any(
+                h.lower() in headers
+                for h in config["headers"]
+            )
+
+        if (
+            status_match and
+            keyword_match and
+            header_match
+        ):
+            return True
+
+    return False
+
+
+# =========================================================
+# CLAIMABILITY CHECK
+# =========================================================
+
+def is_claimable(service):
+
+    return service not in NON_CLAIMABLE
+
+
+# =========================================================
+# MAIN CHECK
+# =========================================================
+
+def check_subdomain(domain):
+
+    result = {
+        "domain": domain,
+        "vulnerable": False,
+        "takeoverable": False,
+        "service": None,
+        "details": {}
+    }
+
+    domain = clean_domain(domain)
+
+    time.sleep(0.1)
+
+    result["details"]["dig_checked"] = True
+
+    run_dig(domain)
+
+    cname_records = resolve_cname(domain)
+
+    if cname_records is None:
+
+        result["details"]["reason"] = (
+            "NXDOMAIN"
+        )
+
+        return result
+
+    if not cname_records:
+
+        result["details"]["reason"] = (
+            "No CNAME"
+        )
+
+        return result
+
+    cname_target = cname_records[0]
+
+    result["details"]["cname"] = (
+        cname_target
+    )
+
+    service = detect_service(
+        cname_target
+    )
+
+    if not service:
+
+        result["details"]["reason"] = (
+            "Unknown provider"
+        )
+
+        return result
+
+    result["service"] = service
+
+    ssl_valid = check_ssl(domain)
+
+    result["details"]["ssl"] = (
+        ssl_valid
+    )
+
+    dead_target = verify_dead_target(
+        cname_target
+    )
+
+    result["details"]["dead_target"] = (
+        dead_target
+    )
+
+    responses = fetch_http(domain)
+
+    result["details"]["http_checked"] = (
+        True
+    )
+
+    valid_http = validate_http(
+        service,
+        responses
+    )
+
+    claimable = is_claimable(service)
+
+    result["details"]["claimable"] = (
+        claimable
+    )
+
+    if (
+        dead_target and
+        valid_http and
+        claimable
+    ):
+
+        result["vulnerable"] = True
+
+        result["takeoverable"] = True
+
+        result["details"]["reason"] = (
+            "Strict fingerprint match"
+        )
+
+    elif dead_target:
+
+        result["vulnerable"] = True
+
+        result["takeoverable"] = False
+
+        result["details"]["reason"] = (
+            "Dead DNS only"
+        )
+
+    return result
+
+
+# =========================================================
+# SCANNER
+# =========================================================
+
+def scan_domains(domains, threads=10):
+
+    results = []
+
+    with ThreadPoolExecutor(
+        max_workers=threads
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                check_subdomain,
+                d
+            ): d
+            for d in domains
+        }
+
+        for future in as_completed(futures):
+
+            domain = futures[future]
+
+            try:
+
+                result = future.result()
+
+                results.append(result)
+
+                if result["takeoverable"]:
+
+                    print(
+                        f"{RED}{BOLD}[CRITICAL]{RESET} "
+                        f"{domain} "
+                        f"-> "
+                        f"{CYAN}{result['service']}{RESET}"
+                    )
+
+                elif result["vulnerable"]:
+
+                    print(
+                        f"{YELLOW}[WARNING]{RESET} "
+                        f"{domain}"
+                    )
+
+                else:
+
+                    print(
+                        f"{GREEN}[SAFE]{RESET} "
+                        f"{domain}"
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"{RED}[ERROR]{RESET} "
+                    f"{domain}: {e}"
+                )
+
+    return results
+
+
+# =========================================================
+# SUMMARY
+# =========================================================
+
+def print_summary(results):
+
+    critical = [
+        r for r in results
+        if r["takeoverable"]
+    ]
+
+    warnings = [
+        r for r in results
+        if (
+            r["vulnerable"]
+            and not r["takeoverable"]
+        )
+    ]
+
+    print("\n" + "=" * 60)
+
+    print(
+        f"{BLUE}{BOLD}"
+        f"SCAN SUMMARY"
+        f"{RESET}"
+    )
+
+    print("=" * 60)
+
+    print(f"Critical : {len(critical)}")
+    print(f"Warnings : {len(warnings)}")
+    print(f"Total    : {len(results)}")
+
+    print("=" * 60)
+
+    if critical:
+
+        print(
+            f"\n{RED}{BOLD}"
+            f"[CRITICAL FINDINGS]"
+            f"{RESET}\n"
+        )
+
+        for r in critical:
+
+            print(
+                f"Domain : {r['domain']}"
+            )
+
+            print(
+                f"Service: {r['service']}"
+            )
+
+            print(
+                f"CNAME  : "
+                f"{r['details'].get('cname')}"
+            )
+
+            print()
+
+
+# =========================================================
+# SAVE JSON
+# =========================================================
+
+def save_json(results, filename):
+
+    with open(filename, "w") as f:
+
+        json.dump(
+            results,
+            f,
+            indent=2
+        )
+
+    print(
+        f"\n{CYAN}[+] Saved -> "
+        f"{filename}{RESET}"
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+if __name__ == "__main__":
+
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=
+        "Ultra Strict Takeover Scanner"
+    )
+
+    parser.add_argument(
+        "-d",
+        "--domain",
+        help="Single domain"
+    )
+
+    parser.add_argument(
+        "-f",
+        "--file",
+        help="File with domains"
+    )
+
+    parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=10
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output JSON file"
+    )
+
+    args = parser.parse_args()
+
+    domains = []
+
+    if args.domain:
+
+        domains = [args.domain]
+
+    elif args.file:
+
+        with open(args.file, "r") as f:
+
+            domains = [
+                clean_domain(line)
+                for line in f
+                if line.strip()
+            ]
+
+    else:
+
+        print("Use -d or -f")
+
+        sys.exit(1)
+
+    print(
+        f"\n{CYAN}{BOLD}[+] Starting scan "
+        f"against {len(domains)} "
+        f"domains...{RESET}\n"
+    )
+
+    results = scan_domains(
+        domains,
+        threads=args.threads
+    )
+
+    print_summary(results)
+
+    if args.output:
+
+        save_json(
+            results,
+            args.output
+        )
