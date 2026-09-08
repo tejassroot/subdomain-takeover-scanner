@@ -94,11 +94,14 @@ SERVICES = {
 
     "heroku": {
         "patterns": [
-            r"\.herokuapp\.com$"
+            r"\.herokuapp\.com$",
+            r"\.herokussl\.com$"
         ],
-        "status_codes": [404],
+        "status_codes": [404, 502, 503],
         "keywords": [
-            "No such app"
+            "No such app",
+            "Heroku | No such app",
+            "herokucdn.com/error-pages/no-such-app.html"
         ],
         "takeoverable": True
     },
@@ -106,7 +109,8 @@ SERVICES = {
     "aws-s3": {
         "patterns": [
             r"\.s3\.amazonaws\.com$",
-            r"\.s3-[a-z0-9-]+\.amazonaws\.com$"
+            r"\.s3-[a-z0-9-]+\.amazonaws\.com$",
+            r"\.s3\.dualstack\.[a-z0-9-]+\.amazonaws\.com$"
         ],
         "headers": [
             "x-amz-request-id",
@@ -129,7 +133,88 @@ SERVICES = {
         ],
         "status_codes": [404],
         "keywords": [
-            "The specified blob does not exist"
+            "The specified blob does not exist",
+            "The specified container does not exist"
+        ],
+        "takeoverable": True
+    },
+
+    "surge": {
+        "patterns": [
+            r"\.surge\.sh$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "project not found"
+        ],
+        "takeoverable": True
+    },
+
+    "readme": {
+        "patterns": [
+            r"\.readme\.io$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "Project doesnt exist",
+            "Project doesn't exist"
+        ],
+        "takeoverable": True
+    },
+
+    "ghost": {
+        "patterns": [
+            r"\.ghost\.io$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "The thing you were looking for is no longer here",
+            "Domain is not configured"
+        ],
+        "takeoverable": True
+    },
+
+    "zendesk": {
+        "patterns": [
+            r"\.zendesk\.com$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "Help Center Closed"
+        ],
+        "takeoverable": True
+    },
+
+    "pantheon": {
+        "patterns": [
+            r"\.pantheonsite\.io$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "The gods are wise, but do not know of the site which you seek"
+        ],
+        "takeoverable": True
+    },
+
+    "fastly": {
+        "patterns": [
+            r"\.fastly\.net$",
+            r"\.fastlylb\.net$"
+        ],
+        "status_codes": [404, 500],
+        "keywords": [
+            "Fastly error: unknown domain"
+        ],
+        "takeoverable": True
+    },
+
+    "wordpress": {
+        "patterns": [
+            r"\.wordpress\.com$"
+        ],
+        "status_codes": [404],
+        "keywords": [
+            "Do you want to register"
         ],
         "takeoverable": True
     },
@@ -151,7 +236,8 @@ SERVICES = {
         ],
         "status_codes": [403],
         "keywords": [
-            "Site Disabled"
+            "Site Disabled",
+            "Error 404 - Web app not found"
         ],
         "takeoverable": False
     }
@@ -171,7 +257,11 @@ def clean_domain(domain):
         domain
     )
 
-    return domain
+    domain = re.sub(r'^https?://', '', domain)
+    domain = re.sub(r'/.*$', '', domain)
+    domain = re.sub(r':\d+$', '', domain)
+
+    return domain.strip().lower()
 
 
 # =========================================================
@@ -224,19 +314,13 @@ def check_target_exists(target):
 
 def verify_dead_target(target):
 
-    checks = []
+    # Rapid initial check
+    if check_target_exists(target) is not False:
+        return False
 
-    for _ in range(3):
-
-        result = check_target_exists(
-            target
-        )
-
-        checks.append(result)
-
-        time.sleep(1)
-
-    return all(x is False for x in checks)
+    # Short confirmation retry to filter transient network glitches
+    time.sleep(0.3)
+    return check_target_exists(target) is False
 
 
 # =========================================================
@@ -435,12 +519,6 @@ def check_subdomain(domain):
 
     domain = clean_domain(domain)
 
-    time.sleep(0.1)
-
-    result["details"]["dig_checked"] = True
-
-    run_dig(domain)
-
     cname_records = resolve_cname(domain)
 
     if cname_records is None:
@@ -450,6 +528,18 @@ def check_subdomain(domain):
         )
 
         return result
+
+    if not cname_records:
+        # Fallback to dig subprocess if dnspython had no answers
+        dig_out = run_dig(domain)
+        if dig_out:
+            for line in dig_out.splitlines():
+                if "CNAME" in line and not line.startswith(";"):
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        cname_records = [parts[-1].rstrip(".")]
+                        result["details"]["dig_fallback"] = True
+                        break
 
     if not cname_records:
 
